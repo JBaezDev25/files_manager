@@ -2,11 +2,20 @@
 """Simple Tkinter GUI for the file transfer helper."""
 
 import socket
+import stat
 import threading
 from pathlib import Path
 from queue import Empty, Queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import cast
+
+try:
+    import paramiko
+except ImportError as exc:  # pragma: no cover - gui helper
+    raise SystemExit(
+        "Missing dependency: paramiko. Install with 'pip install paramiko'."
+    ) from exc
 
 from file_transfer import (
     copy_path,
@@ -36,6 +45,7 @@ class TransferGUI:
         self.progress_var = tk.IntVar()
         self.status_var = tk.StringVar(value="Idle")
         self.connection_state = tk.StringVar(value="disconnected")
+        self.cred_state = tk.StringVar(value="unvalidated")
 
         self.queue: Queue = Queue()
         self.worker: threading.Thread | None = None
@@ -161,7 +171,35 @@ class TransferGUI:
         self._set_connection_indicator("red")
         ttk.Button(
             conn_frame, text="Check Connection", command=self._check_connection
+        ).pack(side=tk.LEFT, padx=(0, pad))
+        ttk.Button(
+            conn_frame, text="Validate Credentials", command=self._validate_credentials
         ).pack(side=tk.LEFT)
+
+        browse_frame = ttk.LabelFrame(top, text="Remote directories", padding=pad)
+        browse_frame.pack(fill=tk.BOTH, expand=True, pady=(pad / 2, 0))
+
+        src_remote_frame = ttk.Frame(browse_frame)
+        src_remote_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, pad))
+        ttk.Label(src_remote_frame, text="Source root entries").pack(anchor=tk.W)
+        self.src_remote_list = tk.Listbox(src_remote_frame, height=8)
+        self.src_remote_list.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(
+            src_remote_frame,
+            text="Add as source",
+            command=self._add_selected_remote_source,
+        ).pack(anchor=tk.E, pady=(pad / 2, 0))
+
+        dst_remote_frame = ttk.Frame(browse_frame)
+        dst_remote_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(dst_remote_frame, text="Destination root entries").pack(anchor=tk.W)
+        self.dst_remote_list = tk.Listbox(dst_remote_frame, height=8)
+        self.dst_remote_list.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(
+            dst_remote_frame,
+            text="Use as destination",
+            command=self._use_selected_remote_destination,
+        ).pack(anchor=tk.E, pady=(pad / 2, 0))
 
     def _add_sources(self, new_paths: list[Path]) -> None:
         for p in new_paths:
@@ -285,6 +323,98 @@ class TransferGUI:
                 problems.append(f"Destination {dst_ip} not reachable")
             self.status_var.set("Connection failed")
             messagebox.showerror("Connection", "; ".join(problems))
+
+    def _open_sftp(
+        self, host: str, username: str, password: str
+    ) -> paramiko.SFTPClient:
+        transport = paramiko.Transport((host, 22))
+        transport.connect(username=username, password=password)
+        sftp = cast(paramiko.SFTPClient, paramiko.SFTPClient.from_transport(transport))
+        return sftp
+
+    def _list_remote_root(self, host: str, username: str, password: str) -> list[str]:
+        entries: list[str] = []
+        sftp = self._open_sftp(host, username, password)
+        try:
+            for item in sftp.listdir_attr("/"):
+                mode = item.st_mode or 0
+                if stat.S_ISDIR(mode):
+                    name = item.filename
+                    if not self.include_hidden_var.get() and name.startswith("."):
+                        continue
+                    entries.append(name)
+        finally:
+            sftp.close()
+        return sorted(entries)
+
+    def _validate_credentials(self) -> None:
+        src_ip = self.src_ip_var.get().strip()
+        dst_ip = self.dst_ip_var.get().strip()
+        src_user = self.src_user_var.get().strip()
+        dst_user = self.dst_user_var.get().strip()
+        src_pwd = self.src_pwd_var.get()
+        dst_pwd = self.dst_pwd_var.get()
+
+        if not src_ip or not dst_ip or not src_user or not dst_user:
+            messagebox.showerror(
+                "Credentials",
+                "Enter source/destination IPs and usernames before validating.",
+            )
+            return
+
+        self.status_var.set("Validating credentials...")
+        self.root.update_idletasks()
+
+        try:
+            src_dirs = self._list_remote_root(src_ip, src_user, src_pwd)
+        except Exception as e:  # noqa: BLE001
+            self._set_connection_indicator("red")
+            self.cred_state.set("invalid")
+            messagebox.showerror("Credentials", f"Source auth failed: {e}")
+            return
+
+        try:
+            dst_dirs = self._list_remote_root(dst_ip, dst_user, dst_pwd)
+        except Exception as e:  # noqa: BLE001
+            self._set_connection_indicator("red")
+            self.cred_state.set("invalid")
+            messagebox.showerror("Credentials", f"Destination auth failed: {e}")
+            return
+
+        self._set_connection_indicator("green")
+        self.cred_state.set("valid")
+        self.status_var.set("Credentials valid")
+        self._populate_remote_lists(src_dirs, dst_dirs)
+        messagebox.showinfo(
+            "Credentials", "Credentials validated and directories fetched."
+        )
+
+    def _populate_remote_lists(
+        self, src_entries: list[str], dst_entries: list[str]
+    ) -> None:
+        self.src_remote_list.delete(0, tk.END)
+        for name in src_entries:
+            self.src_remote_list.insert(tk.END, f"/{name}")
+        self.dst_remote_list.delete(0, tk.END)
+        for name in dst_entries:
+            self.dst_remote_list.insert(tk.END, f"/{name}")
+
+    def _add_selected_remote_source(self) -> None:
+        selection = self.src_remote_list.curselection()
+        if not selection:
+            return
+        for idx in selection:
+            path = Path(self.src_remote_list.get(idx))
+            if path not in self.sources:
+                self.sources.append(path)
+        self._refresh_sources_list()
+
+    def _use_selected_remote_destination(self) -> None:
+        selection = self.dst_remote_list.curselection()
+        if not selection:
+            return
+        dest = self.dst_remote_list.get(selection[0])
+        self.dest_var.set(dest)
 
     def _run_transfer(
         self,
