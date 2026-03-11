@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Simple Tkinter GUI for the file transfer helper."""
 
+import socket
 import threading
 from pathlib import Path
 from queue import Empty, Queue
@@ -34,6 +35,7 @@ class TransferGUI:
 
         self.progress_var = tk.IntVar()
         self.status_var = tk.StringVar(value="Idle")
+        self.connection_state = tk.StringVar(value="disconnected")
 
         self.queue: Queue = Queue()
         self.worker: threading.Thread | None = None
@@ -150,6 +152,17 @@ class TransferGUI:
             anchor=tk.E, pady=(pad, 0)
         )
 
+        conn_frame = ttk.Frame(top)
+        conn_frame.pack(fill=tk.X, pady=(pad / 2, 0))
+        self.conn_canvas = tk.Canvas(
+            conn_frame, width=18, height=18, highlightthickness=0
+        )
+        self.conn_canvas.pack(side=tk.LEFT, padx=(0, pad))
+        self._set_connection_indicator("red")
+        ttk.Button(
+            conn_frame, text="Check Connection", command=self._check_connection
+        ).pack(side=tk.LEFT)
+
     def _add_sources(self, new_paths: list[Path]) -> None:
         for p in new_paths:
             if p not in self.sources:
@@ -232,6 +245,46 @@ class TransferGUI:
             target=self._run_transfer, args=args, daemon=True
         )
         self.worker.start()
+
+    def _probe_ip(self, ip: str, ports: tuple[int, ...] = (22, 80, 443)) -> bool:
+        for port in ports:
+            try:
+                with socket.create_connection((ip, port), timeout=2):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _set_connection_indicator(self, color: str) -> None:
+        self.conn_canvas.delete("all")
+        self.conn_canvas.create_oval(3, 3, 15, 15, fill=color, outline=color)
+        self.connection_state.set("connected" if color == "green" else "disconnected")
+
+    def _check_connection(self) -> None:
+        src_ip = self.src_ip_var.get().strip()
+        dst_ip = self.dst_ip_var.get().strip()
+        if not src_ip or not dst_ip:
+            messagebox.showerror(
+                "Connection", "Enter source and destination IPs first."
+            )
+            return
+        self.status_var.set("Checking connection...")
+        self.root.update_idletasks()
+        src_ok = self._probe_ip(src_ip)
+        dst_ok = self._probe_ip(dst_ip)
+        if src_ok and dst_ok:
+            self._set_connection_indicator("green")
+            self.status_var.set("Connection OK")
+            messagebox.showinfo("Connection", "Source and destination are reachable.")
+        else:
+            self._set_connection_indicator("red")
+            problems = []
+            if not src_ok:
+                problems.append(f"Source {src_ip} not reachable")
+            if not dst_ok:
+                problems.append(f"Destination {dst_ip} not reachable")
+            self.status_var.set("Connection failed")
+            messagebox.showerror("Connection", "; ".join(problems))
 
     def _run_transfer(
         self,
