@@ -8,7 +8,7 @@ from pathlib import Path
 from queue import Empty, Queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import cast
+from typing import Callable, cast
 
 try:
     import paramiko
@@ -49,6 +49,7 @@ class TransferGUI:
 
         self.queue: Queue = Queue()
         self.worker: threading.Thread | None = None
+        self.session_busy = False
 
         self._build_ui()
         self._schedule_queue_check()
@@ -169,12 +170,20 @@ class TransferGUI:
         )
         self.conn_canvas.pack(side=tk.LEFT, padx=(0, pad))
         self._set_connection_indicator("red")
-        ttk.Button(
-            conn_frame, text="Check Connection", command=self._check_connection
-        ).pack(side=tk.LEFT, padx=(0, pad))
-        ttk.Button(
-            conn_frame, text="Validate Credentials", command=self._validate_credentials
-        ).pack(side=tk.LEFT)
+        self.check_btn = ttk.Button(
+            conn_frame, text="Check Connection", command=self._start_check_connection
+        )
+        self.check_btn.pack(side=tk.LEFT, padx=(0, pad))
+        self.validate_btn = ttk.Button(
+            conn_frame,
+            text="Validate Credentials",
+            command=self._start_validate_credentials,
+        )
+        self.validate_btn.pack(side=tk.LEFT)
+        self.session_status = tk.StringVar(value="Idle")
+        ttk.Label(conn_frame, textvariable=self.session_status).pack(
+            side=tk.LEFT, padx=(pad, 0)
+        )
 
         browse_frame = ttk.LabelFrame(top, text="Remote directories", padding=pad)
         browse_frame.pack(fill=tk.BOTH, expand=True, pady=(pad / 2, 0))
@@ -298,7 +307,7 @@ class TransferGUI:
         self.conn_canvas.create_oval(3, 3, 15, 15, fill=color, outline=color)
         self.connection_state.set("connected" if color == "green" else "disconnected")
 
-    def _check_connection(self) -> None:
+    def _start_check_connection(self) -> None:
         src_ip = self.src_ip_var.get().strip()
         dst_ip = self.dst_ip_var.get().strip()
         if not src_ip or not dst_ip:
@@ -306,23 +315,20 @@ class TransferGUI:
                 "Connection", "Enter source and destination IPs first."
             )
             return
-        self.status_var.set("Checking connection...")
-        self.root.update_idletasks()
+        self._set_session_busy(True, "Checking connection...")
+        self._run_session_task(lambda: self._check_connection_task(src_ip, dst_ip))
+
+    def _check_connection_task(self, src_ip: str, dst_ip: str) -> dict[str, object]:
         src_ok = self._probe_ip(src_ip)
         dst_ok = self._probe_ip(dst_ip)
-        if src_ok and dst_ok:
-            self._set_connection_indicator("green")
-            self.status_var.set("Connection OK")
-            messagebox.showinfo("Connection", "Source and destination are reachable.")
-        else:
-            self._set_connection_indicator("red")
+        if not (src_ok and dst_ok):
             problems = []
             if not src_ok:
                 problems.append(f"Source {src_ip} not reachable")
             if not dst_ok:
                 problems.append(f"Destination {dst_ip} not reachable")
-            self.status_var.set("Connection failed")
-            messagebox.showerror("Connection", "; ".join(problems))
+            raise RuntimeError("; ".join(problems))
+        return {"type": "check", "msg": "Connection OK"}
 
     def _open_sftp(
         self, host: str, username: str, password: str
@@ -347,7 +353,7 @@ class TransferGUI:
             sftp.close()
         return sorted(entries)
 
-    def _validate_credentials(self) -> None:
+    def _start_validate_credentials(self) -> None:
         src_ip = self.src_ip_var.get().strip()
         dst_ip = self.dst_ip_var.get().strip()
         src_user = self.src_user_var.get().strip()
@@ -362,32 +368,53 @@ class TransferGUI:
             )
             return
 
-        self.status_var.set("Validating credentials...")
-        self.root.update_idletasks()
-
-        try:
-            src_dirs = self._list_remote_root(src_ip, src_user, src_pwd)
-        except Exception as e:  # noqa: BLE001
-            self._set_connection_indicator("red")
-            self.cred_state.set("invalid")
-            messagebox.showerror("Credentials", f"Source auth failed: {e}")
-            return
-
-        try:
-            dst_dirs = self._list_remote_root(dst_ip, dst_user, dst_pwd)
-        except Exception as e:  # noqa: BLE001
-            self._set_connection_indicator("red")
-            self.cred_state.set("invalid")
-            messagebox.showerror("Credentials", f"Destination auth failed: {e}")
-            return
-
-        self._set_connection_indicator("green")
-        self.cred_state.set("valid")
-        self.status_var.set("Credentials valid")
-        self._populate_remote_lists(src_dirs, dst_dirs)
-        messagebox.showinfo(
-            "Credentials", "Credentials validated and directories fetched."
+        self._set_session_busy(True, "Validating credentials...")
+        self._run_session_task(
+            lambda: self._validate_credentials_task(
+                src_ip, dst_ip, src_user, src_pwd, dst_user, dst_pwd
+            )
         )
+
+    def _validate_credentials_task(
+        self,
+        src_ip: str,
+        dst_ip: str,
+        src_user: str,
+        src_pwd: str,
+        dst_user: str,
+        dst_pwd: str,
+    ) -> dict[str, object]:
+        src_dirs = self._list_remote_root(src_ip, src_user, src_pwd)
+        dst_dirs = self._list_remote_root(dst_ip, dst_user, dst_pwd)
+        return {
+            "type": "validate",
+            "src_dirs": src_dirs,
+            "dst_dirs": dst_dirs,
+            "msg": "Credentials validated and directories fetched.",
+        }
+
+    def _run_session_task(self, worker: Callable[[], dict[str, object]]) -> None:
+        def runner() -> None:
+            try:
+                payload = worker()
+                self.queue.put(("session_ok", payload))
+            except Exception as e:  # noqa: BLE001
+                self.queue.put(("session_error", str(e)))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _set_session_busy(self, busy: bool, message: str | None = None) -> None:
+        self.session_busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.check_btn.config(state=state)
+        self.validate_btn.config(state=state)
+        if message:
+            self.status_var.set(message)
+            self.session_status.set(message)
+        if busy:
+            self._set_connection_indicator("orange")
+        else:
+            self.session_status.set("Idle")
 
     def _populate_remote_lists(
         self, src_entries: list[str], dst_entries: list[str]
@@ -494,10 +521,40 @@ class TransferGUI:
                     self.progress_bar.config(mode="determinate")
                     self.status_var.set(f"Error: {item[1]}")
                     messagebox.showerror("Transfer", item[1])
+                elif kind == "session_ok":
+                    self._handle_session_ok(item[1])
+                elif kind == "session_error":
+                    self._handle_session_error(item[1])
                 self.queue.task_done()
         except Empty:
             pass
         self._schedule_queue_check()
+
+    def _handle_session_ok(self, payload: dict[str, object]) -> None:
+        self._set_session_busy(False)
+        msg = str(payload.get("msg", ""))
+        ptype = payload.get("type")
+        if ptype == "check":
+            self._set_connection_indicator("green")
+            self.status_var.set(msg)
+            messagebox.showinfo("Connection", msg)
+        elif ptype == "validate":
+            src_dirs = payload.get("src_dirs", [])
+            dst_dirs = payload.get("dst_dirs", [])
+            self._set_connection_indicator("green")
+            self.cred_state.set("valid")
+            self.status_var.set(msg)
+            self._populate_remote_lists(
+                cast(list[str], src_dirs), cast(list[str], dst_dirs)
+            )
+            messagebox.showinfo("Credentials", msg)
+
+    def _handle_session_error(self, error: str) -> None:
+        self._set_session_busy(False)
+        self._set_connection_indicator("red")
+        self.cred_state.set("invalid")
+        self.status_var.set(f"Error: {error}")
+        messagebox.showerror("Session", error)
 
 
 def main() -> None:
