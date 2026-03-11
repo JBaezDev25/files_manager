@@ -17,11 +17,14 @@ except ImportError as exc:  # pragma: no cover - gui helper
         "Missing dependency: paramiko. Install with 'pip install paramiko'."
     ) from exc
 
+from smb.SMBConnection import SMBConnection
+
 from file_transfer import (
     copy_path,
     expand_source_spec,
     is_online,
     log,
+    smb_copy_path,
     total_bytes,
 )
 
@@ -41,6 +44,9 @@ class TransferGUI:
         self.dst_pwd_var = tk.StringVar()
         self.pattern_var = tk.StringVar()
         self.include_hidden_var = tk.BooleanVar(value=True)
+        self.mode_var = tk.StringVar(value="local")  # local copy vs smb upload
+        self.share_var = tk.StringVar()
+        self.remote_path_var = tk.StringVar(value="/")
 
         self.progress_var = tk.IntVar()
         self.status_var = tk.StringVar(value="Idle")
@@ -74,6 +80,21 @@ class TransferGUI:
         ttk.Entry(net_frame, textvariable=self.dst_ip_var, width=18).grid(
             row=0, column=3, sticky=tk.W
         )
+
+        mode_frame = ttk.LabelFrame(top, text="Transfer Mode", padding=pad)
+        mode_frame.pack(fill=tk.X, pady=(0, pad))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Local copy",
+            variable=self.mode_var,
+            value="local",
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            mode_frame,
+            text="SMB upload",
+            variable=self.mode_var,
+            value="smb",
+        ).pack(side=tk.LEFT, padx=(pad, 0))
 
         cred_frame = ttk.LabelFrame(top, text="Credentials (optional)", padding=pad)
         cred_frame.pack(fill=tk.X, pady=(0, pad))
@@ -147,6 +168,17 @@ class TransferGUI:
         )
         ttk.Button(dest_row, text="Browse", command=self._choose_dest).pack(
             side=tk.LEFT, padx=(pad, 0)
+        )
+
+        smb_row = ttk.Frame(dest_frame)
+        smb_row.pack(fill=tk.X, pady=(pad / 2, 0))
+        ttk.Label(smb_row, text="SMB share").pack(side=tk.LEFT)
+        ttk.Entry(smb_row, textvariable=self.share_var, width=18).pack(
+            side=tk.LEFT, padx=(pad / 2, pad)
+        )
+        ttk.Label(smb_row, text="Remote path").pack(side=tk.LEFT)
+        ttk.Entry(smb_row, textvariable=self.remote_path_var, width=24).pack(
+            side=tk.LEFT, padx=(pad / 2, 0)
         )
 
         progress_frame = ttk.Frame(top)
@@ -267,10 +299,20 @@ class TransferGUI:
             messagebox.showerror("Transfer", "Add at least one source path.")
             return
 
+        mode = self.mode_var.get()
         dest = self.dest_var.get().strip()
-        if not dest:
-            messagebox.showerror("Transfer", "Destination directory is required.")
-            return
+        share = self.share_var.get().strip()
+        remote_path = self.remote_path_var.get().strip()
+        if mode == "local":
+            if not dest:
+                messagebox.showerror("Transfer", "Destination directory is required.")
+                return
+        elif mode == "smb":
+            if not share:
+                messagebox.showerror("Transfer", "SMB share name is required.")
+                return
+            if not remote_path:
+                remote_path = "/"
 
         self.progress_var.set(0)
         self.progress_bar.config(mode="determinate")
@@ -286,6 +328,9 @@ class TransferGUI:
             self.sources.copy(),
             Path(dest).expanduser(),
             self.include_hidden_var.get(),
+            mode,
+            share,
+            remote_path,
         )
 
         self.worker = threading.Thread(
@@ -331,16 +376,34 @@ class TransferGUI:
         return {"type": "check", "msg": "Connection OK"}
 
     def _open_sftp(
-        self, host: str, username: str, password: str
+        self, host: str, username: str, password: str, timeout: int = 6
     ) -> paramiko.SFTPClient:
-        transport = paramiko.Transport((host, 22))
-        transport.connect(username=username, password=password)
+        try:
+            sock = socket.create_connection((host, 22), timeout=timeout)
+            sock.settimeout(timeout)
+        except socket.timeout as e:
+            raise TimeoutError(f"SSH connect to {host}:22 timed out") from e
+        transport = paramiko.Transport(sock)
+        transport.banner_timeout = timeout
+        transport.auth_timeout = timeout
+        try:
+            transport.connect(username=username, password=password)
+        except socket.timeout as e:
+            raise TimeoutError(f"SSH auth to {host}:22 timed out") from e
         sftp = cast(paramiko.SFTPClient, paramiko.SFTPClient.from_transport(transport))
+        try:
+            chan = sftp.get_channel()
+            if chan:
+                chan.settimeout(timeout)
+        except Exception:
+            pass
         return sftp
 
-    def _list_remote_root(self, host: str, username: str, password: str) -> list[str]:
+    def _list_remote_root(
+        self, host: str, username: str, password: str, timeout: int = 6
+    ) -> list[str]:
         entries: list[str] = []
-        sftp = self._open_sftp(host, username, password)
+        sftp = self._open_sftp(host, username, password, timeout=timeout)
         try:
             for item in sftp.listdir_attr("/"):
                 mode = item.st_mode or 0
@@ -454,16 +517,20 @@ class TransferGUI:
         sources: list[Path],
         dest: Path,
         include_hidden: bool,
+        mode: str,
+        share: str,
+        remote_path: str,
     ) -> None:
         try:
             self.queue.put(("status", "Checking network..."))
             if not is_online():
                 raise RuntimeError("Network check failed. Connect and retry.")
 
-            if not dest.exists():
-                dest.mkdir(parents=True, exist_ok=True)
-            if not dest.is_dir():
-                raise NotADirectoryError(f"Destination is not a directory: {dest}")
+            if mode == "local":
+                if not dest.exists():
+                    dest.mkdir(parents=True, exist_ok=True)
+                if not dest.is_dir():
+                    raise NotADirectoryError(f"Destination is not a directory: {dest}")
 
             total = total_bytes(sources, include_hidden=include_hidden)
             if total == 0:
@@ -478,19 +545,49 @@ class TransferGUI:
 
             log(
                 "Transfer started. Sources: "
-                f"{', '.join(map(str, sources))}; Destination: {dest}; "
-                f"SrcIP={src_ip}; DstIP={dst_ip}; "
+                f"{', '.join(map(str, sources))}; "
+                f"Dest={'local ' + str(dest) if mode == 'local' else f'SMB {share}:{remote_path}'}; "
+                f"Mode={mode}; SrcIP={src_ip}; DstIP={dst_ip}; "
                 f"SrcUser={src_user}; DstUser={dst_user}"
             )
 
-            for src in sources:
-                copy_path(
-                    src,
-                    dest,
-                    progress,
-                    progress_cb,
-                    include_hidden=include_hidden,
+            if mode == "local":
+                for src in sources:
+                    copy_path(
+                        src,
+                        dest,
+                        progress,
+                        progress_cb,
+                        include_hidden=include_hidden,
+                    )
+            else:
+                self.queue.put(("status", "Connecting to SMB..."))
+                conn = SMBConnection(
+                    dst_user,
+                    dst_pwd,
+                    socket.gethostname(),
+                    dst_ip,
+                    use_ntlm_v2=True,
+                    is_direct_tcp=True,
                 )
+                if not conn.connect(dst_ip, 445, timeout=6):
+                    raise RuntimeError("SMB connection failed")
+                try:
+                    for src in sources:
+                        smb_copy_path(
+                            src,
+                            conn,
+                            share,
+                            remote_path,
+                            progress,
+                            progress_cb,
+                            include_hidden=include_hidden,
+                        )
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
             log(f"Transfer completed. Bytes: {total}")
             self.queue.put(("done", "File Transfer Completed"))

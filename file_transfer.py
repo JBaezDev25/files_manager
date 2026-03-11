@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from smb.SMBConnection import SMBConnection
+
 
 LOG_PATH = Path(__file__).with_name("log.txt")
 BAR_WIDTH = 40
@@ -176,6 +178,33 @@ def copy_file(
     shutil.copystat(src, dst, follow_symlinks=True)
 
 
+class _ProgressReader:
+    def __init__(
+        self,
+        wrapped,
+        progress: dict[str, int],
+        progress_cb: Callable[[int, int, str], None] | None,
+        name: str,
+    ):
+        self._wrapped = wrapped
+        self._progress = progress
+        self._cb = progress_cb
+        self._name = name
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._wrapped.read(size)
+        self._progress["done"] += len(data)
+        if data and self._cb:
+            self._cb(self._progress["done"], self._progress["total"], self._name)
+        return data
+
+    def seek(self, *args, **kwargs):  # passthrough for compatibility
+        return self._wrapped.seek(*args, **kwargs)
+
+    def tell(self, *args, **kwargs):
+        return self._wrapped.tell(*args, **kwargs)
+
+
 def copy_path(
     src: Path,
     dest_root: Path,
@@ -196,6 +225,69 @@ def copy_path(
                 rel = item.relative_to(src)
                 target = dest_root / src.name / rel
                 copy_file(item, target, progress, progress_cb)
+
+
+def _ensure_remote_dir(
+    conn: SMBConnection, share: str, remote_dir: str, base: str = ""
+) -> None:
+    # remote_dir like "folder/sub"
+    parts = [p for p in Path(remote_dir).as_posix().split("/") if p]
+    current = base.strip("/")
+    for part in parts:
+        current = f"{current}/{part}" if current else part
+        try:
+            conn.createDirectory(share, current)
+        except Exception:
+            # ignore if exists
+            continue
+
+
+def smb_copy_path(
+    src: Path,
+    conn: SMBConnection,
+    share: str,
+    remote_base: str,
+    progress: dict[str, int],
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    include_hidden: bool = True,
+) -> None:
+    base = remote_base.strip("/")
+    if src.is_file():
+        rel_path = src.name
+        remote_path = f"{base}/{rel_path}" if base else rel_path
+        _upload_file(src, conn, share, remote_path, progress, progress_cb)
+    else:
+        for root, dirs, files in os.walk(src):
+            if not include_hidden:
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+                files = [name for name in files if not name.startswith(".")]
+            for name in files:
+                item = Path(root) / name
+                rel = item.relative_to(src)
+                rel_path = (Path(src.name) / rel).as_posix()
+                remote_path = f"{base}/{rel_path}" if base else rel_path
+                _upload_file(item, conn, share, remote_path, progress, progress_cb)
+
+
+def _upload_file(
+    src: Path,
+    conn: SMBConnection,
+    share: str,
+    remote_path: str,
+    progress: dict[str, int],
+    progress_cb: Callable[[int, int, str], None] | None,
+) -> None:
+    remote_dir = str(Path(remote_path).parent)
+    if remote_dir and remote_dir != ".":
+        _ensure_remote_dir(conn, share, remote_dir)
+    with src.open("rb") as f:
+        reader = _ProgressReader(f, progress, progress_cb, src.name)
+        conn.storeFile(share, remote_path, reader)
+    try:
+        mtime = src.stat().st_mtime
+        conn.setAttributes(share, remote_path, attrTime=mtime)
+    except Exception:
+        pass
 
 
 def main() -> None:
