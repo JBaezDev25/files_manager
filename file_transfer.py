@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Guided file transfer helper with connectivity check, prompts, progress bar, and logging."""
 
+import fnmatch
 import getpass
 import os
 import shutil
@@ -9,6 +10,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 
 LOG_PATH = Path(__file__).with_name("log.txt")
@@ -44,18 +46,70 @@ def prompt_credentials(label: str) -> tuple[str, str]:
     return user, pwd
 
 
+def prompt_ip(label: str) -> str:
+    ip = input(f"Enter {label} IP: ").strip()
+    if not ip:
+        raise ValueError(f"{label.title()} IP is required.")
+    return ip
+
+
+def _anchor_root(pattern: str) -> Path:
+    parts = Path(pattern).expanduser().parts
+    anchor_parts: list[str] = []
+    for part in parts:
+        if any(ch in part for ch in "*?["):
+            break
+        anchor_parts.append(part)
+    if not anchor_parts:
+        return Path("/" if pattern.startswith(os.sep) else os.getcwd())
+    return Path(*anchor_parts)
+
+
+def expand_source_spec(spec: str) -> list[Path]:
+    expanded_spec = os.path.abspath(os.path.expanduser(spec))
+
+    if not any(ch in expanded_spec for ch in "*?["):
+        path = Path(expanded_spec)
+        if not path.exists():
+            raise FileNotFoundError(f"Source not found: {path}")
+        return [path.resolve()]
+
+    anchor = _anchor_root(expanded_spec)
+    if not anchor.exists():
+        raise FileNotFoundError(f"Base path for pattern does not exist: {anchor}")
+
+    matches: set[Path] = set()
+    for root, dirs, files in os.walk(anchor):
+        for name in dirs + files:
+            candidate = os.path.join(root, name)
+            if fnmatch.fnmatch(candidate, expanded_spec):
+                matches.add(Path(candidate).resolve())
+
+    if not matches:
+        raise FileNotFoundError(f"No matches for source pattern: {spec}")
+
+    return sorted(matches)
+
+
 def collect_sources() -> list[Path]:
-    raw = input("Enter source file/folder paths (comma-separated): ").strip()
+    raw = input(
+        "Enter source file/folder paths (comma-separated, '*' allowed): "
+    ).strip()
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     if not parts:
         raise ValueError("No source paths provided.")
+
     paths: list[Path] = []
-    for p in parts:
-        path = Path(p).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"Source not found: {path}")
-        paths.append(path)
-    return paths
+    for spec in parts:
+        paths.extend(expand_source_spec(spec))
+
+    unique_paths = []
+    seen = set()
+    for p in paths:
+        if p not in seen:
+            unique_paths.append(p)
+            seen.add(p)
+    return unique_paths
 
 
 def ensure_destination() -> Path:
@@ -74,14 +128,18 @@ def ensure_destination() -> Path:
     return dest
 
 
-def total_bytes(paths: list[Path]) -> int:
+def total_bytes(paths: list[Path], include_hidden: bool = True) -> int:
     total = 0
     for p in paths:
         if p.is_file():
             total += p.stat().st_size
         else:
-            for file in p.rglob("*"):
-                if file.is_file():
+            for root, dirs, files in os.walk(p):
+                if not include_hidden:
+                    dirs[:] = [name for name in dirs if not name.startswith(".")]
+                    files = [name for name in files if not name.startswith(".")]
+                for name in files:
+                    file = Path(root) / name
                     total += file.stat().st_size
     return total
 
@@ -97,7 +155,12 @@ def print_progress(done: int, total: int, current_file: str) -> None:
     sys.stdout.flush()
 
 
-def copy_file(src: Path, dst: Path, progress: dict[str, int]) -> None:
+def copy_file(
+    src: Path,
+    dst: Path,
+    progress: dict[str, int],
+    progress_cb: Callable[[int, int, str], None] | None = None,
+) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     with src.open("rb") as fsrc, dst.open("wb") as fdst:
         while True:
@@ -106,21 +169,33 @@ def copy_file(src: Path, dst: Path, progress: dict[str, int]) -> None:
                 break
             fdst.write(chunk)
             progress["done"] += len(chunk)
-            print_progress(progress["done"], progress["total"], src.name)
+            if progress_cb:
+                progress_cb(progress["done"], progress["total"], src.name)
+            else:
+                print_progress(progress["done"], progress["total"], src.name)
     shutil.copystat(src, dst, follow_symlinks=True)
 
 
-def copy_path(src: Path, dest_root: Path, progress: dict[str, int]) -> None:
+def copy_path(
+    src: Path,
+    dest_root: Path,
+    progress: dict[str, int],
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    include_hidden: bool = True,
+) -> None:
     if src.is_file():
         target = dest_root / src.name
-        copy_file(src, target, progress)
+        copy_file(src, target, progress, progress_cb)
     else:
-        for item in src.rglob("*"):
-            if item.is_dir():
-                continue
-            rel = item.relative_to(src)
-            target = dest_root / src.name / rel
-            copy_file(item, target, progress)
+        for root, dirs, files in os.walk(src):
+            if not include_hidden:
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+                files = [name for name in files if not name.startswith(".")]
+            for name in files:
+                item = Path(root) / name
+                rel = item.relative_to(src)
+                target = dest_root / src.name / rel
+                copy_file(item, target, progress, progress_cb)
 
 
 def main() -> None:
@@ -130,8 +205,11 @@ def main() -> None:
             msg = "Network check failed. Please connect and retry."
             print(msg)
             log(msg)
-            print("!!!Somethign went Wrong!!")
+            print("!!!Something went Wrong!!")
             return
+
+        src_ip = prompt_ip("source")
+        dst_ip = prompt_ip("destination")
 
         src_user, src_pwd = prompt_credentials("source (for auditing only)")
         dst_user, dst_pwd = prompt_credentials("destination (for auditing only)")
@@ -146,6 +224,7 @@ def main() -> None:
         log(
             "Transfer started. Sources: "
             f"{', '.join(map(str, sources))}; Destination: {dest}; "
+            f"SrcIP={src_ip}; DstIP={dst_ip}; "
             f"SrcUser={src_user}; DstUser={dst_user}"
         )
 
@@ -172,7 +251,7 @@ File Transfer Completed
     except Exception as e:
         log(f"Transfer failed: {e}")
         print(f"\nError: {e}")
-        print("!!!Somethign went Wrong!!")
+        print("!!!Something went Wrong!!")
 
 
 if __name__ == "__main__":

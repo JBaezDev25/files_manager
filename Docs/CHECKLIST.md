@@ -3,12 +3,11 @@
 - Verify network connectivity before any transfer begins.
 - Validate all source paths exist and are readable; flag and skip missing items.
 - Confirm the destination is writable and has sufficient free space for the transfer.
-- Prompt for optional source and destination login credentials for audit.
-- Collect user-selected source files and folders (comma-separated input).
-- Ask for destination directory, allow creating it if missing, and ensure it is a directory.
-- Offer destination login capture alongside destination path selection.
+- Prompt for source and destination IPs and optional credentials for audit.
+- Collect source files/folders via patterns, file/folder pickers, and allow wildcards that include hidden items when enabled.
+- Ask for destination directory (GUI browse), allow creating it if missing, and ensure it is a directory.
 - Copy all selected files and folders into the destination (preserve structure and metadata).
-- Show a live progress bar based on total bytes copied.
+- Show a live progress indicator in the GUI based on total bytes copied.
 - Emit per-item checksums after copy and log verification results.
 - Write transfer activity to `log.txt` with timestamps and context.
 - Display success banner `File Transfer Completed` when done.
