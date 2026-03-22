@@ -3,6 +3,7 @@
 
 import fnmatch
 import getpass
+import hashlib
 import os
 import shutil
 import socket
@@ -12,7 +13,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from ftplib import FTP
 from smb.SMBConnection import SMBConnection
+import paramiko
+
+
+def compute_checksum(path: Path, algorithm: str = "sha256") -> str:
+    hash_func = hashlib.new(algorithm)
+    with path.open("rb") as f:
+        while chunk := f.read(CHUNK_SIZE):
+            hash_func.update(chunk)
+    return hash_func.hexdigest()
+
+
+def verify_checksum(src: Path, dst: Path, algorithm: str = "sha256") -> bool:
+    if not dst.exists():
+        return False
+    src_hash = compute_checksum(src, algorithm)
+    dst_hash = compute_checksum(dst, algorithm)
+    return src_hash == dst_hash
 
 
 LOG_PATH = Path(__file__).with_name("log.txt")
@@ -164,18 +184,88 @@ def copy_file(
     progress_cb: Callable[[int, int, str], None] | None = None,
 ) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    with src.open("rb") as fsrc, dst.open("wb") as fdst:
-        while True:
-            chunk = fsrc.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            fdst.write(chunk)
-            progress["done"] += len(chunk)
-            if progress_cb:
-                progress_cb(progress["done"], progress["total"], src.name)
-            else:
-                print_progress(progress["done"], progress["total"], src.name)
-    shutil.copystat(src, dst, follow_symlinks=True)
+    try:
+        with src.open("rb") as fsrc, dst.open("wb") as fdst:
+            while True:
+                chunk = fsrc.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                progress["done"] += len(chunk)
+                if progress_cb:
+                    progress_cb(progress["done"], progress["total"], src.name)
+                else:
+                    print_progress(progress["done"], progress["total"], src.name)
+        try:
+            shutil.copystat(src, dst, follow_symlinks=False)
+        except OSError:
+            pass
+    except IOError as e:
+        raise IOError(f"Failed to copy {src}: {e}")
+
+
+class TransferState:
+    def __init__(self, state_file: Path):
+        self.state_file = state_file
+        self.completed_files: set[str] = set()
+        self.load()
+
+    def load(self) -> None:
+        if self.state_file.exists():
+            with self.state_file.open() as f:
+                self.completed_files = set(line.strip() for line in f if line.strip())
+
+    def save(self) -> None:
+        with self.state_file.open("w") as f:
+            for name in self.completed_files:
+                f.write(f"{name}\n")
+
+    def is_completed(self, src_name: str) -> bool:
+        return src_name in self.completed_files
+
+    def mark_completed(self, src_name: str) -> None:
+        self.completed_files.add(src_name)
+        self.save()
+
+
+def copy_file_resume(
+    src: Path,
+    dst: Path,
+    progress: dict[str, int],
+    state: TransferState | None = None,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_size = dst.stat().st_size if dst.exists() else 0
+    src_size = src.stat().st_size
+
+    if existing_size >= src_size:
+        progress["done"] += src_size
+        if progress_cb:
+            progress_cb(progress["done"], progress["total"], src.name)
+        return
+
+    try:
+        with src.open("rb") as fsrc, dst.open("ab") as fdst:
+            fsrc.seek(existing_size)
+            while True:
+                chunk = fsrc.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                progress["done"] += len(chunk)
+                if progress_cb:
+                    progress_cb(progress["done"], progress["total"], src.name)
+                else:
+                    print_progress(progress["done"], progress["total"], src.name)
+
+        try:
+            shutil.copystat(src, dst, follow_symlinks=False)
+        except OSError:
+            pass
+    except IOError as e:
+        raise IOError(f"Failed to copy {src}: {e}")
 
 
 class _ProgressReader:
@@ -225,6 +315,61 @@ def copy_path(
                 rel = item.relative_to(src)
                 target = dest_root / src.name / rel
                 copy_file(item, target, progress, progress_cb)
+
+
+def verify_copy(src: Path, dest_root: Path, include_hidden: bool = True) -> bool:
+    if src.is_file():
+        target = dest_root / src.name
+        return verify_checksum(src, target)
+    else:
+        for root, dirs, files in os.walk(src):
+            if not include_hidden:
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+                files = [name for name in files if not name.startswith(".")]
+            for name in files:
+                item = Path(root) / name
+                rel = item.relative_to(src)
+                target = dest_root / src.name / rel
+                if not verify_checksum(item, target):
+                    return False
+    return True
+
+
+def _copy_single_file(args: tuple) -> None:
+    src, target, progress = args
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("rb") as fsrc, target.open("wb") as fdst:
+        while True:
+            chunk = fsrc.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            fdst.write(chunk)
+            progress["done"] += len(chunk)
+
+
+def parallel_copy(
+    src: Path,
+    dest_root: Path,
+    progress: dict[str, int],
+    max_workers: int = 4,
+) -> None:
+    files_to_copy = []
+
+    if src.is_file():
+        target = dest_root / src.name
+        files_to_copy.append((src, target, progress))
+    else:
+        for root, dirs, files in os.walk(src):
+            for name in files:
+                item = Path(root) / name
+                rel = item.relative_to(src)
+                target = dest_root / src.name / rel
+                files_to_copy.append((item, target, progress))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_copy_single_file, args) for args in files_to_copy]
+        for future in as_completed(futures):
+            future.result()
 
 
 def _ensure_remote_dir(
@@ -290,6 +435,151 @@ def _upload_file(
         pass
 
 
+def connect_ftp(host: str, user: str, password: str) -> FTP:
+    ftp = FTP(host)
+    if user and password:
+        ftp.login(user, password)
+    else:
+        ftp.login()
+    return ftp
+
+
+def _ensure_ftp_dir(ftp: FTP, path: str) -> None:
+    dirs = [p for p in Path(path).as_posix().split("/") if p]
+    current = ""
+    for d in dirs:
+        current = f"{current}/{d}" if current else d
+        try:
+            ftp.mkd(current)
+        except Exception:
+            pass
+        try:
+            ftp.cwd(current)
+        except Exception:
+            pass
+    ftp.cwd("/")
+
+
+def ftp_upload_file(
+    src: Path,
+    ftp: FTP,
+    remote_path: str,
+    progress: dict[str, int],
+    progress_cb: Callable[[int, int, str], None] | None = None,
+) -> None:
+    remote_dir = str(Path(remote_path).parent)
+    if remote_dir and remote_dir != ".":
+        _ensure_ftp_dir(ftp, remote_dir)
+
+    with src.open("rb") as f:
+
+        def callback(data: bytes) -> None:
+            progress["done"] += len(data)
+            if progress_cb:
+                progress_cb(progress["done"], progress["total"], src.name)
+
+        ftp.storbinary(f"STOR {remote_path}", f, callback=callback)
+
+
+def ftp_copy_path(
+    src: Path,
+    ftp: FTP,
+    remote_base: str,
+    progress: dict[str, int],
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    include_hidden: bool = True,
+) -> None:
+    base = remote_base.strip("/")
+    if src.is_file():
+        rel_path = src.name
+        remote_path = f"{base}/{rel_path}" if base else rel_path
+        ftp_upload_file(src, ftp, remote_path, progress, progress_cb)
+    else:
+        for root, dirs, files in os.walk(src):
+            if not include_hidden:
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+                files = [name for name in files if not name.startswith(".")]
+            for name in files:
+                item = Path(root) / name
+                rel = item.relative_to(src)
+                rel_path = (Path(src.name) / rel).as_posix()
+                remote_path = f"{base}/{rel_path}" if base else rel_path
+                ftp_upload_file(item, ftp, remote_path, progress, progress_cb)
+
+
+def connect_sftp(
+    host: str, user: str, password: str, port: int = 22
+) -> paramiko.SFTPClient:
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(host, port=port, username=user, password=password)
+    return ssh.open_sftp()
+
+
+def _ensure_sftp_dir(sftp: paramiko.SFTPClient, path: str) -> None:
+    dirs = [p for p in Path(path).as_posix().split("/") if p]
+    current = ""
+    for d in dirs:
+        current = f"{current}/{d}" if current else d
+        try:
+            sftp.mkdir(current)
+        except Exception:
+            pass
+        try:
+            sftp.chdir(current)
+        except Exception:
+            pass
+    sftp.chdir("/")
+
+
+def sftp_upload_file(
+    src: Path,
+    sftp: paramiko.SFTPClient,
+    remote_path: str,
+    progress: dict[str, int],
+    progress_cb: Callable[[int, int, str], None] | None = None,
+) -> None:
+    remote_dir = str(Path(remote_path).parent)
+    if remote_dir and remote_dir != ".":
+        _ensure_sftp_dir(sftp, remote_dir)
+
+    file_size = src.stat().st_size
+    with src.open("rb") as f:
+
+        def callback(total: int, _sent: int) -> None:
+            progress["done"] += total
+            if progress_cb:
+                progress_cb(progress["done"], progress["total"], src.name)
+
+        sftp.putfo(f, remote_path, callback=callback)
+
+
+def sftp_copy_path(
+    src: Path,
+    sftp: paramiko.SFTPClient,
+    remote_base: str,
+    progress: dict[str, int],
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    include_hidden: bool = True,
+) -> None:
+    base = remote_base.strip("/")
+    if src.is_file():
+        rel_path = src.name
+        remote_path = f"{base}/{rel_path}" if base else rel_path
+        sftp_upload_file(src, sftp, remote_path, progress, progress_cb)
+    else:
+        for root, dirs, files in os.walk(src):
+            if not include_hidden:
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+                files = [name for name in files if not name.startswith(".")]
+            for name in files:
+                item = Path(root) / name
+                rel = item.relative_to(src)
+                rel_path = (Path(src.name) / rel).as_posix()
+                remote_path = f"{base}/{rel_path}" if base else rel_path
+                sftp_upload_file(item, sftp, remote_path, progress, progress_cb)
+
+
 def main() -> None:
     try:
         print("Checking network connectivity...")
@@ -325,10 +615,20 @@ def main() -> None:
         for src in sources:
             copy_path(src, dest, progress)
 
+        print("\nVerifying copied files...")
+        all_verified = True
+        for src in sources:
+            if not verify_copy(src, dest):
+                all_verified = False
+                log(f"Verification FAILED for: {src}")
+
+        if not all_verified:
+            raise RuntimeError("Verification failed! Checksums don't match.")
+
         duration = time.time() - start
         print_progress(progress["done"], progress["total"], "done")
         print()  # newline after progress bar
-        log(f"Transfer completed in {duration:.2f}s. Bytes: {total}")
+        log(f"Transfer completed and verified in {duration:.2f}s. Bytes: {total}")
         print(
             r"""
   _____ _ _        _______                            _           _ 
