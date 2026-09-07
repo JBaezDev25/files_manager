@@ -26,6 +26,20 @@ script, and (for the resume feature) a small state file tracking which files alr
 finished. Talks to the network only when you choose SMB/FTP/SFTP mode. Gotcha: passwords
 you type are held only in memory for that run and are never written to `log.txt`.
 
+**Why it's written this way:** The transfer functions are plain module-level functions
+rather than classes because each backend (local filesystem, SMB via `pysmb`, FTP via
+`ftplib`, SFTP via `paramiko`) has such a different native API (callbacks vs. generators
+vs. file-like objects) that a shared class hierarchy would mostly exist to paper over
+those differences — a lightweight shared convention (a `progress` dict plus an optional
+`progress_cb`) lets both the CLI and the GUI report progress uniformly without forcing
+every backend through one abstraction. `TransferState` persists completed filenames as a
+flat newline-delimited text file rather than a small database, which is enough
+bookkeeping for a single operator running one transfer at a time and avoids pulling in a
+dependency just to track a set of strings. Passwords are deliberately kept in local
+variables only (never written to `log.txt`) because this is a manual, interactive tool
+run by one person at a time — there's no multi-user session or credential-vault
+requirement to justify anything heavier.
+
 ### `file_transfer_gui.py`
 This is the point-and-click desktop version — run `python file_transfer_gui.py` to open
 a window (requires a display; needs `paramiko` installed, which it checks for on
@@ -41,6 +55,19 @@ Under the hood it calls the same copy/upload functions defined in `file_transfer
 Reads/writes: the same `log.txt` file, plus whatever local or remote paths you point it
 at. Gotcha: closing the window while a transfer is running asks for confirmation first.
 
+**Why it's written this way:** Tkinter was chosen over a heavier GUI toolkit because it
+ships with the Python standard library, so this small internal tool needs nothing extra
+installed just to get a window on screen. The transfer itself runs on a background
+`threading.Thread` that only ever pushes tuples onto a `Queue`, which the main thread
+polls every 100ms via `root.after` — Tkinter widgets aren't safe to update from a
+non-main thread, so this queue-and-poll pattern is the standard way to keep a long-running
+network transfer from freezing the window while still getting live progress into it. The
+GUI imports its copy/upload logic straight from `file_transfer.py` rather than
+reimplementing any of it, keeping the CLI and GUI as two front ends over one shared
+engine. NAS presets (Synology, QNAP, WD My Cloud) are hardcoded as a small fixed list
+rather than loaded from a config file, which is reasonable given there are only a
+handful of them and they rarely change.
+
 ### `test_file_transfer.py`
 Automated test suite for `file_transfer.py`, run with `pytest test_file_transfer.py` (or
 just `pytest` from the project folder). It checks that checksum computation and
@@ -53,3 +80,13 @@ raise an error for patterns that match nothing, and that the network connectivit
 correctly reports online/offline. These tests create and clean up their own temporary
 files — they don't touch any real project data. Gotcha: `test_is_online` makes a real
 network connection attempt (to 8.8.8.8), so it will fail if run with no internet access.
+
+**Why it's written this way:** Tests use real temporary files and directories
+(`tempfile.NamedTemporaryFile`, `tempfile.TemporaryDirectory`) instead of mocking the
+filesystem, which is a reasonable trade for a script whose whole job is moving real bytes
+between real paths — mocking `open()`/`shutil` calls would test that the mocks were
+called correctly rather than that files actually get copied and verified byte-for-byte.
+Letting `test_is_online` hit the real internet (8.8.8.8) instead of mocking `socket` is a
+deliberate, if fragile, simplification: it exercises the actual connectivity check the
+tool relies on before every transfer, at the cost of the test suite depending on network
+access being available wherever it runs.
