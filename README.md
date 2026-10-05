@@ -58,8 +58,8 @@ You will be guided through:
 
 Example input:
 ```
-Enter source IP: 192.168.1.10
-Enter destination IP: 192.168.1.20
+Enter source IP: 192.0.2.10
+Enter destination IP: 192.0.2.20
 Enter source file/folder paths: /home/user/documents, /home/user/*.log
 Enter destination directory: /mnt/backup
 ```
